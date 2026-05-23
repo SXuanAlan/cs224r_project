@@ -1,0 +1,83 @@
+run:
+  name: pusht_fm_raw_smoke
+  seed: 0
+
+dataset:
+  path: data/pusht/pusht_cchi_v7_replay.zarr
+  obs_key: state
+  action_key: action
+  env_obs_type: state
+  limit_demos: 8
+  val_fraction: 0.25
+
+chunking:
+  horizon: 16
+  observation_horizon: 2
+  stride: 4
+
+target:
+  type: raw
+  dct_k: null
+
+normalization:
+  action:
+    type: per_dim_minmax
+    eps: 1.0e-8
+  obs:
+    type: per_dim_zscore
+    eps: 1.0e-8
+
+model:
+  type: temporal_unet
+  base_dim: 32
+  dim_mults: [1, 2]
+  time_embed_dim: 64
+  cond_dim: 128
+  kernel_size: 5
+  groups: 8
+  dropout: 0.0
+
+training:
+  device: cuda
+  epochs: 1
+  batch_size: 32
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  num_workers: 0
+  max_train_steps_per_epoch: 2
+  eval_every_epochs: 1
+  grad_clip_norm: 1.0
+  ema:
+    enabled: true
+    decay: 0.995
+  lr_scheduler:
+    type: cosine
+    warmup_steps: 2
+    min_lr_scale: 0.05
+
+sampling:
+  num_flow_steps: 2
+  clip_normalized_actions: true
+
+simulation_video:
+  enabled: false
+  seed: 0
+  n_rollouts: 1
+  horizon: 20
+  action_exec_horizon: 8
+  fps: 20
+  video_skip: 2
+  success_reward_threshold: 0.95
+
+wandb:
+  enabled: false
+  project: cs224r-fgac
+  entity: null
+  mode: disabled
+  tags: [smoke, pusht, flow_matching, raw]
+
+outputs:
+  log_dir: logs/train/pusht_smoke
+  checkpoints_dir: outputs/train/pusht_smoke/checkpoints
+  metrics_dir: outputs/train/pusht_smoke/metrics
+  videos_dir: outputs/train/pusht_smoke/videos

@@ -1,0 +1,102 @@
+run:
+  name: can_ph_fm_dct_lowfreq_k8
+  seed: 0
+
+dataset:
+  path: robomimic/datasets/can/ph/low_dim_v15.hdf5
+  limit_demos: null
+  val_fraction: 0.1
+  obs_keys:
+    - object
+    - robot0_eef_pos
+    - robot0_eef_quat
+    - robot0_gripper_qpos
+
+action:
+  source: auto
+  action_dict_keys:
+    - rel_pos
+    - rel_rot_6d
+    - gripper
+  legacy_key: actions
+
+chunking:
+  horizon: 16
+  observation_horizon: 2
+  stride: 1
+
+target:
+  type: dct_lowfreq
+  dct_k: 8
+
+normalization:
+  action:
+    type: per_dim_minmax
+    eps: 1.0e-8
+  obs:
+    type: per_dim_zscore
+    eps: 1.0e-8
+
+model:
+  type: temporal_unet
+  base_dim: 128
+  dim_mults: [1, 2, 4]
+  time_embed_dim: 128
+  cond_dim: 256
+  kernel_size: 5
+  groups: 8
+  dropout: 0.0
+
+training:
+  device: cuda
+  epochs: 1000
+  batch_size: 256
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  num_workers: 0
+  max_train_steps_per_epoch: null
+  eval_every_epochs: 10
+  grad_clip_norm: 1.0
+  ema:
+    enabled: true
+    decay: 0.995
+  lr_scheduler:
+    type: cosine
+    warmup_steps: 500
+    min_lr_scale: 0.05
+
+sampling:
+  num_flow_steps: 32
+  clip_normalized_actions: true
+
+eval_video:
+  enabled: false
+  num_examples: 4
+  fps: 4
+  log_to_wandb: true
+
+simulation_video:
+  enabled: false
+  reset_mode: env
+  seed: 0
+  n_rollouts: 10
+  horizon: 400
+  action_exec_horizon: 8
+  camera_names: [agentview]
+  height: 512
+  width: 512
+  fps: 20
+  video_skip: 1
+
+wandb:
+  enabled: true
+  project: cs224r-fgac
+  entity: null
+  mode: online
+  tags: [milestone, can, flow_matching, dct_lowfreq]
+
+outputs:
+  log_dir: logs/train/can_dct_lowfreq_k8
+  checkpoints_dir: outputs/train/can_dct_lowfreq_k8/checkpoints
+  metrics_dir: outputs/train/can_dct_lowfreq_k8/metrics
+  videos_dir: outputs/train/can_dct_lowfreq_k8/videos

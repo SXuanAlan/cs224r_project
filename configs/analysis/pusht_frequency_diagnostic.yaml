@@ -1,0 +1,25 @@
+run:
+  name: pusht_frequency_diagnostic
+  seed: 0
+
+dataset:
+  path: data/pusht/pusht_cchi_v7_replay.zarr
+  obs_key: state
+  action_key: action
+  limit_demos: null
+  val_fraction: 0.1
+  analysis_split: all
+
+chunking:
+  horizon: 16
+  stride: 1
+  k_values: [2, 4, 8, 12, 16]
+
+normalization:
+  type: per_dim_minmax
+  eps: 1.0e-8
+
+outputs:
+  log_dir: logs/analysis/pusht_frequency_diagnostic
+  metrics_dir: outputs/analysis/pusht_frequency_diagnostic/metrics
+  figures_dir: outputs/analysis/pusht_frequency_diagnostic/figures

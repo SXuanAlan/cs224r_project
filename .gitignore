@@ -1,2 +1,7 @@
 robomimic/*
 robosuite/*
+__pycache__/
+*.py[cod]
+logs/
+outputs/
+data/
