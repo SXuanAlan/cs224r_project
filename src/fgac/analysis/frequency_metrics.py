@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from fgac.transforms.dct import idct_time
+from fgac.transforms.dct import dct_time, idct_time
 
 
 def reconstruction_mse(reference: np.ndarray, reconstructed: np.ndarray) -> float:
@@ -41,6 +41,74 @@ def mean_frequency_energy(z: np.ndarray, dims: list[int] | None = None, eps: flo
     total = np.sum(energy, axis=1, keepdims=True)
     normalized = energy / (total + eps)
     return np.mean(normalized, axis=0).tolist()
+
+
+def per_phase_spectrum(
+    actions_per_chunk: np.ndarray,
+    gripper_dim_index: int,
+    tau: float = 1.0,
+    channel_groups: dict[str, list[int]] | None = None,
+    eps: float = 1e-12,
+) -> dict[str, Any]:
+    """Compute transition-conditioned DCT spectra for action chunks.
+
+    Chunks are labeled transition if the gripper action changes by more than
+    ``tau`` between any adjacent timestep. Energy is normalized per chunk
+    before averaging, so each returned vector sums to approximately 1.
+    """
+    if actions_per_chunk.ndim != 3:
+        raise ValueError(f"Expected [N, H, d] actions, got shape {actions_per_chunk.shape}")
+    if not 0 <= gripper_dim_index < actions_per_chunk.shape[-1]:
+        raise ValueError(f"Invalid gripper_dim_index={gripper_dim_index} for dim={actions_per_chunk.shape[-1]}")
+
+    groups = channel_groups or _default_channel_groups(actions_per_chunk.shape[-1], gripper_dim_index)
+    gripper = actions_per_chunk[..., gripper_dim_index]
+    transition = np.any(np.abs(np.diff(gripper, axis=1)) > float(tau), axis=1)
+    z = dct_time(actions_per_chunk)
+
+    result: dict[str, Any] = {
+        "tau": float(tau),
+        "gripper_dim_index": int(gripper_dim_index),
+        "num_chunks": int(actions_per_chunk.shape[0]),
+        "transition_chunks": int(np.sum(transition)),
+        "non_transition_chunks": int(np.sum(~transition)),
+        "phases": {},
+    }
+    for name, mask in {"transition": transition, "non_transition": ~transition}.items():
+        result["phases"][name] = {
+            "aggregate": _phase_energy(z[mask], dims=None, eps=eps),
+            "per_channel": {
+                group_name: _phase_energy(z[mask], dims=dims, eps=eps)
+                for group_name, dims in groups.items()
+            },
+        }
+    return result
+
+
+def _phase_energy(z: np.ndarray, dims: list[int] | None, eps: float) -> list[float]:
+    if z.shape[0] == 0:
+        horizon = int(z.shape[1]) if z.ndim == 3 else 0
+        return [0.0 for _ in range(horizon)]
+    coeffs = z if dims is None else z[..., dims]
+    energy = np.sum(coeffs**2, axis=-1)
+    total = np.sum(energy, axis=1, keepdims=True)
+    normalized = energy / (total + eps)
+    return np.mean(normalized, axis=0).tolist()
+
+
+def _default_channel_groups(action_dim: int, gripper_dim_index: int) -> dict[str, list[int]]:
+    if action_dim >= 7 and gripper_dim_index == 6:
+        return {
+            "translation": [0, 1, 2],
+            "rotation": [3, 4, 5],
+            "gripper": [6],
+        }
+    non_gripper = [idx for idx in range(action_dim) if idx != gripper_dim_index]
+    return {
+        "translation": non_gripper,
+        "rotation": [],
+        "gripper": [gripper_dim_index],
+    }
 
 
 def summarize_frequency_metrics(
@@ -84,4 +152,3 @@ def summarize_frequency_metrics(
         "groups": {group_name: mean_frequency_energy(z, dims=dims) for group_name, dims in groups.items()},
     }
     return by_k, spectrum
-

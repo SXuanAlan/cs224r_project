@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Train PushT raw or low-frequency-DCT temporal-UNet Flow Matching baselines."""
+"""Train PushT raw or DCT temporal-UNet Flow Matching baselines."""
 
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ from fgac.data.normalization import fit_minmax, fit_zscore
 from fgac.data.pusht_zarr import load_pusht_replay, pusht_dataset_summary
 from fgac.data.robomimic_hdf5 import build_obs_action_chunks, split_demos
 from fgac.models.flow_matching import TemporalUNetFlow, euler_sample, flow_matching_loss
+from fgac.transforms.dct import topk_frequency_bins
 from fgac.utils.config import load_yaml, save_yaml
 
 
@@ -212,6 +213,11 @@ def _decode_actions(target: np.ndarray, cfg: dict[str, Any], train_ds) -> np.nda
     if cfg["target"]["type"] == "dct_lowfreq":
         coeffs = np.zeros((target.shape[0], train_ds.horizon, train_ds.action_dim), dtype=np.float32)
         coeffs[:, : int(cfg["target"]["dct_k"]), :] = target
+        return idct(coeffs, axis=1, norm="ortho")
+    if cfg["target"]["type"] == "dct_fullfreq":
+        return idct(target, axis=1, norm="ortho")
+    if cfg["target"]["type"] == "dct_sparse":
+        coeffs, _ = topk_frequency_bins(target, int(cfg["target"]["dct_k"]))
         return idct(coeffs, axis=1, norm="ortho")
     raise ValueError(f"Unsupported target.type: {cfg['target']['type']}")
 

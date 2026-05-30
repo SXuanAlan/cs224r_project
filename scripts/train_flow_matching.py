@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Train raw or low-frequency-DCT action chunk Flow Matching baselines."""
+"""Train raw or DCT action chunk Flow Matching baselines."""
 
 from __future__ import annotations
 
@@ -41,6 +41,7 @@ from fgac.data.robomimic_hdf5 import (
     split_demos,
 )
 from fgac.models.flow_matching import FlowMatchingMLP, TemporalUNetFlow, euler_sample, flow_matching_loss
+from fgac.transforms.dct import topk_frequency_bins
 from fgac.utils.config import load_yaml, save_yaml
 
 
@@ -460,6 +461,13 @@ def _decode_actions(target: np.ndarray, cfg: dict[str, Any], train_ds: FlowMatch
         k = int(cfg["target"]["dct_k"])
         coeffs = np.zeros((target.shape[0], train_ds.horizon, train_ds.action_dim), dtype=np.float32)
         coeffs[:, :k, :] = target if target.ndim == 3 else target.reshape(target.shape[0], k, train_ds.action_dim)
+        return idct(coeffs, axis=1, norm="ortho")
+    if target_type == "dct_fullfreq":
+        coeffs = target if target.ndim == 3 else target.reshape(target.shape[0], train_ds.horizon, train_ds.action_dim)
+        return idct(coeffs, axis=1, norm="ortho")
+    if target_type == "dct_sparse":
+        coeffs = target if target.ndim == 3 else target.reshape(target.shape[0], train_ds.horizon, train_ds.action_dim)
+        coeffs, _ = topk_frequency_bins(coeffs, int(cfg["target"]["dct_k"]))
         return idct(coeffs, axis=1, norm="ortho")
     raise ValueError(f"Unsupported target_type: {target_type}")
 

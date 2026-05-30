@@ -23,6 +23,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from fgac.models.flow_matching import TemporalUNetFlow, euler_sample
+from fgac.transforms.dct import topk_frequency_bins
 
 
 def parse_args() -> argparse.Namespace:
@@ -175,6 +176,11 @@ def _decode_target(target: np.ndarray, cfg: dict[str, Any], metadata: dict[str, 
     if cfg["target"]["type"] == "dct_lowfreq":
         coeffs = np.zeros((target.shape[0], horizon, action_dim), dtype=np.float32)
         coeffs[:, : int(cfg["target"]["dct_k"]), :] = target
+        return idct(coeffs, axis=1, norm="ortho")
+    if cfg["target"]["type"] == "dct_fullfreq":
+        return idct(target, axis=1, norm="ortho")
+    if cfg["target"]["type"] == "dct_sparse":
+        coeffs, _ = topk_frequency_bins(target, int(cfg["target"]["dct_k"]))
         return idct(coeffs, axis=1, norm="ortho")
     raise ValueError(f"Unsupported target.type: {cfg['target']['type']}")
 

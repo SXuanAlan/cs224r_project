@@ -26,6 +26,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from fgac.models.flow_matching import FlowMatchingMLP, TemporalUNetFlow, euler_sample
+from fgac.transforms.dct import topk_frequency_bins
 from fgac.utils.config import load_yaml
 
 
@@ -147,6 +148,12 @@ def _load_model(ckpt: dict[str, Any], metadata: dict[str, Any], cfg: dict[str, A
         target_seq_len = horizon
     elif target_type == "dct_lowfreq":
         target_seq_len = int(cfg["target"]["dct_k"])
+        target_dim = target_seq_len * action_dim
+    elif target_type == "dct_fullfreq":
+        target_seq_len = horizon
+        target_dim = target_seq_len * action_dim
+    elif target_type == "dct_sparse":
+        target_seq_len = horizon
         target_dim = target_seq_len * action_dim
     else:
         raise ValueError(f"Unsupported target type: {target_type}")
@@ -329,6 +336,13 @@ def _decode_target(target: np.ndarray, cfg: dict[str, Any], metadata: dict[str, 
         k = int(cfg["target"]["dct_k"])
         coeffs = np.zeros((target.shape[0], horizon, action_dim), dtype=np.float32)
         coeffs[:, :k, :] = target if target.ndim == 3 else target.reshape(target.shape[0], k, action_dim)
+        return idct(coeffs, axis=1, norm="ortho")
+    if cfg["target"]["type"] == "dct_fullfreq":
+        coeffs = target if target.ndim == 3 else target.reshape(target.shape[0], horizon, action_dim)
+        return idct(coeffs, axis=1, norm="ortho")
+    if cfg["target"]["type"] == "dct_sparse":
+        coeffs = target if target.ndim == 3 else target.reshape(target.shape[0], horizon, action_dim)
+        coeffs, _ = topk_frequency_bins(coeffs, int(cfg["target"]["dct_k"]))
         return idct(coeffs, axis=1, norm="ortho")
     raise ValueError(f"Unsupported target type: {cfg['target']['type']}")
 
