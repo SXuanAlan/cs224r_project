@@ -6,26 +6,6 @@ CS224R: Deep Reinforcement Learning, Stanford University, Spring 2026
 
 Alan Zhao and Juhyun Jung
 
-## Summary
-
-This project studies action representations for generative imitation policies.
-The policy predicts short action chunks, and the main question is whether those
-chunks should be modeled directly in the raw time domain or through a
-frequency-domain representation such as DCT.
-
-The final report compares raw Flow Matching, full-frequency DCT, sparse DCT at
-several `K` values, stochastic residual variants, and channel-aware sparse DCT
-on Can, Square, Push-T, and PegInsertionSide. The reported results are based on
-single-seed, 50-rollout evaluations.
-
-The submitted final report is:
-
-- `docs/reports/final project report.pdf`
-
-Final report figures are stored in:
-
-- `docs/reports/figures/final_report/`
-
 ## Method
 
 For each action chunk `A` with horizon `H`, DCT variants transform each action
