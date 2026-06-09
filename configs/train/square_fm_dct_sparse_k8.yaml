@@ -1,9 +1,9 @@
 run:
-  name: can_ph_fm_dct_sparse_k8_seed1
-  seed: 1
+  name: square_ph_fm_dct_sparse_k8
+  seed: 0
 
 dataset:
-  path: robomimic/datasets/can/ph/low_dim_v15.hdf5
+  path: robomimic/datasets/square/ph/low_dim_v15.hdf5
   limit_demos: null
   val_fraction: 0.1
   obs_keys:
@@ -78,7 +78,7 @@ eval_video:
 simulation_video:
   enabled: false
   reset_mode: env
-  seed: 1
+  seed: 0
   n_rollouts: 10
   horizon: 400
   action_exec_horizon: 8
@@ -93,10 +93,10 @@ wandb:
   project: cs224r-fgac
   entity: null
   mode: online
-  tags: [next_stage, can, flow_matching, dct_sparse]
+  tags: [square, flow_matching, dct_sparse]
 
 outputs:
-  log_dir: logs/train/can_dct_sparse_k8
-  checkpoints_dir: outputs/train/can_dct_sparse_k8/checkpoints
-  metrics_dir: outputs/train/can_dct_sparse_k8/metrics
-  videos_dir: outputs/train/can_dct_sparse_k8/videos
+  log_dir: logs/train/square_dct_sparse_k8
+  checkpoints_dir: outputs/train/square_dct_sparse_k8/checkpoints
+  metrics_dir: outputs/train/square_dct_sparse_k8/metrics
+  videos_dir: outputs/train/square_dct_sparse_k8/videos

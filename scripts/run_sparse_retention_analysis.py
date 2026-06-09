@@ -31,6 +31,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="configs/analysis/can_frequency_diagnostic.yaml")
     parser.add_argument("--k", type=int, default=8)
     parser.add_argument("--tau", type=float, default=None)
+    parser.add_argument("--output-root", default="outputs/analysis/p1c_can_sparse_retention")
+    parser.add_argument("--task-name", default="can_ph")
+    parser.add_argument("--title-task", default="Can-PH")
+    parser.add_argument("--stdout-prefix", default="[P1.c follow-up]")
     parser.add_argument(
         "--write-count-artifacts",
         action="store_true",
@@ -42,7 +46,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cfg = load_yaml(PROJECT_ROOT / args.config)
-    chunks, groups, gripper_dim, tau = _load_can_chunks(cfg, args.tau)
+    chunks, groups, gripper_dim, tau = _load_chunks(cfg, args.tau)
     z = dct_time(chunks)
     z_sparse, selected = topk_frequency_bins(z, int(args.k))
     transition = np.any(np.abs(np.diff(chunks[..., gripper_dim], axis=1)) > tau, axis=1)
@@ -65,9 +69,10 @@ def main() -> None:
         k=int(args.k),
         tau=tau,
         gripper_dim=gripper_dim,
+        task_name=args.task_name,
     )
 
-    out_root = PROJECT_ROOT / "outputs" / "analysis" / "p1c_can_sparse_retention"
+    out_root = PROJECT_ROOT / args.output_root
     metrics_dir = out_root / "metrics"
     figures_dir = out_root / "figures"
     metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -76,7 +81,7 @@ def main() -> None:
     count_metrics_path = metrics_dir / "retention.json"
     if args.write_count_artifacts:
         count_metrics_path.write_text(json.dumps(count_metrics, indent=2) + "\n", encoding="utf-8")
-        _plot_count_histogram(count_metrics, figures_dir / "sparse_retention_histogram.png")
+        _plot_count_histogram(count_metrics, figures_dir / "sparse_retention_histogram.png", args.title_task)
     elif count_metrics_path.exists():
         with count_metrics_path.open("r", encoding="utf-8") as f:
             count_metrics = json.load(f)
@@ -85,9 +90,10 @@ def main() -> None:
     magnitude_metrics_path.write_text(json.dumps(magnitude_metrics, indent=2) + "\n", encoding="utf-8")
     magnitude_figure_path = figures_dir / "sparse_retention_magnitude.png"
     combined_figure_path = figures_dir / "sparse_retention_combined.png"
-    _plot_magnitude_bars(magnitude_samples, magnitude_figure_path, high_freq_cutoff)
-    _plot_combined(count_metrics, magnitude_samples, combined_figure_path, high_freq_cutoff)
+    _plot_magnitude_bars(magnitude_samples, magnitude_figure_path, high_freq_cutoff, args.title_task)
+    _plot_combined(count_metrics, magnitude_samples, combined_figure_path, high_freq_cutoff, args.title_task)
 
+    count_fractions = _high_count_fractions(count_metrics, high_freq_cutoff)
     total_ratio = _ratio(
         magnitude_metrics["transition"]["total_high_freq_magnitude"]["mean"],
         magnitude_metrics["non_transition"]["total_high_freq_magnitude"]["mean"],
@@ -100,13 +106,20 @@ def main() -> None:
     print(magnitude_figure_path.relative_to(PROJECT_ROOT))
     print(combined_figure_path.relative_to(PROJECT_ROOT))
     flag = " [FLAG: total-magnitude ratio < 2]" if total_ratio < 2.0 else ""
-    print(
-        "[P1.c follow-up] transition / non_transition total-magnitude ratio = "
-        f"{total_ratio:.3f}, mean-magnitude ratio = {mean_ratio:.3f}{flag}"
-    )
+    if args.stdout_prefix == "[Square retention]":
+        print(
+            f"{args.stdout_prefix} count k>=8 fraction T/NT = "
+            f"{count_fractions['transition']:.3f}/{count_fractions['non_transition']:.3f}; "
+            f"total-magnitude ratio = {total_ratio:.3f}; mean-magnitude ratio = {mean_ratio:.3f}{flag}"
+        )
+    else:
+        print(
+            f"{args.stdout_prefix} transition / non_transition total-magnitude ratio = "
+            f"{total_ratio:.3f}, mean-magnitude ratio = {mean_ratio:.3f}{flag}"
+        )
 
 
-def _load_can_chunks(cfg: dict[str, Any], tau_override: float | None) -> tuple[np.ndarray, dict[str, list[int]], int, float]:
+def _load_chunks(cfg: dict[str, Any], tau_override: float | None) -> tuple[np.ndarray, dict[str, list[int]], int, float]:
     dataset_path = PROJECT_ROOT / cfg["dataset"]["path"]
     action_data = load_actions(
         dataset_path,
@@ -182,6 +195,7 @@ def _magnitude_metrics(
     k: int,
     tau: float,
     gripper_dim: int,
+    task_name: str,
 ) -> tuple[dict[str, Any], dict[str, dict[str, np.ndarray]]]:
     abs_high = np.abs(z_sparse[:, high_freq_cutoff:, :])
     total_high = np.sum(abs_high, axis=(1, 2))
@@ -200,7 +214,7 @@ def _magnitude_metrics(
     }
     metrics = {
         "config": {
-            "task": "can_ph",
+            "task": task_name,
             "H": int(z_sparse.shape[1]),
             "K_sparse": int(k),
             "tau_gripper": float(tau),
@@ -240,7 +254,15 @@ def _ratio(numerator: float, denominator: float) -> float:
     return float(numerator / denominator)
 
 
-def _plot_count_histogram(metrics: dict[str, Any], ax_or_path: Any) -> None:
+def _high_count_fractions(metrics: dict[str, Any], high_freq_cutoff: int) -> dict[str, float]:
+    fractions = {}
+    for phase in ["transition", "non_transition"]:
+        counts = np.asarray(metrics["counts_per_k"][phase], dtype=np.float64)
+        fractions[phase] = float(np.sum(counts[high_freq_cutoff:]) / max(np.sum(counts), 1.0))
+    return fractions
+
+
+def _plot_count_histogram(metrics: dict[str, Any], ax_or_path: Any, title_task: str = "Can") -> None:
     owns_figure = not hasattr(ax_or_path, "bar")
     if owns_figure:
         fig, ax = plt.subplots(figsize=(8.0, 4.5))
@@ -258,7 +280,7 @@ def _plot_count_histogram(metrics: dict[str, Any], ax_or_path: Any) -> None:
     ax.bar(x - width / 2, transition, width=width, label="transition")
     ax.bar(x + width / 2, non_transition, width=width, label="non-transition")
     ax.axvline(7.5, linestyle="--", color="black", linewidth=1.0, label="K=8 cutoff")
-    ax.set_title("Can Sparse DCT Frequency-Bin Retention")
+    ax.set_title(f"{title_task} Sparse DCT Frequency-Bin Retention")
     ax.set_xlabel("DCT frequency index k")
     ax.set_ylabel("Fraction of retained bins")
     ax.set_xticks(x)
@@ -274,6 +296,7 @@ def _plot_magnitude_bars(
     samples: dict[str, dict[str, np.ndarray]],
     path: Path,
     high_freq_cutoff: int,
+    title_task: str,
 ) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2))
     _plot_phase_bars(
@@ -290,7 +313,7 @@ def _plot_magnitude_bars(
         "Mean magnitude per retained high-frequency coefficient",
         f"Mean |z| per kept k$\\geq${high_freq_cutoff} coefficient",
     )
-    fig.suptitle(f"Magnitude-weighted sparse retention on Can-PH (K={high_freq_cutoff})")
+    fig.suptitle(f"Magnitude-weighted sparse retention on {title_task} (K={high_freq_cutoff})")
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)
@@ -317,9 +340,10 @@ def _plot_combined(
     magnitude_samples: dict[str, dict[str, np.ndarray]],
     path: Path,
     high_freq_cutoff: int,
+    title_task: str,
 ) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
-    _plot_count_histogram(count_metrics, axes[0])
+    _plot_count_histogram(count_metrics, axes[0], title_task)
     axes[0].set_title("(a) Count-based retained-bin distribution")
     _plot_phase_bars(
         magnitude_samples,
@@ -335,7 +359,7 @@ def _plot_combined(
         "(c) Mean magnitude per kept high-frequency coefficient",
         f"Mean |z| per kept k$\\geq${high_freq_cutoff} coefficient",
     )
-    fig.suptitle(f"Sparse retention on Can-PH (K={high_freq_cutoff})")
+    fig.suptitle(f"Sparse retention on {title_task} (K={high_freq_cutoff})")
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)

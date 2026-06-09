@@ -2,6 +2,10 @@ robomimic/*
 robosuite/*
 __pycache__/
 *.py[cod]
-logs/
-outputs/
 data/
+
+# Track outputs/logs, but keep only final best checkpoints among .pt files.
+outputs/
+!outputs/**/best.pt
+logs/
+

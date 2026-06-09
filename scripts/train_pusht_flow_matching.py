@@ -17,7 +17,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from scipy.fft import idct
 from torch.utils.data import DataLoader
 
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -32,8 +31,26 @@ from fgac.data.chunk_dataset import FlowMatchingChunkDataset
 from fgac.data.normalization import fit_minmax, fit_zscore
 from fgac.data.pusht_zarr import load_pusht_replay, pusht_dataset_summary
 from fgac.data.robomimic_hdf5 import build_obs_action_chunks, split_demos
-from fgac.models.flow_matching import TemporalUNetFlow, euler_sample, flow_matching_loss
-from fgac.transforms.dct import topk_frequency_bins
+from fgac.models.flow_matching import (
+    FrequencySoftmaskTemporalUNetFlow,
+    TemporalUNetFlow,
+    euler_sample,
+    flow_matching_loss,
+)
+from fgac.models.policy_io import (
+    base_noise_mode,
+    base_num_flow_steps,
+    combine_base_and_residual,
+    combine_raw_base_and_residual,
+    is_anchored_residual,
+    is_raw_anchored_residual,
+    is_sparse_dct_anchored_residual,
+    load_base_policy_from_config,
+    raw_anchored_residual_target,
+    sample_normalized_actions,
+    sparse_dct_anchored_residual_target,
+)
+from fgac.transforms.dct import dct_time_torch, decode_action_target, idct_time_torch
 from fgac.utils.config import load_yaml, save_yaml
 
 
@@ -84,7 +101,7 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=int(cfg["training"]["batch_size"]), shuffle=False, num_workers=int(cfg["training"]["num_workers"]))
 
     device = torch.device("cuda" if cfg["training"]["device"] == "cuda" and torch.cuda.is_available() else "cpu")
-    model = TemporalUNetFlow(
+    base_model = TemporalUNetFlow(
         obs_dim=train_ds.obs.shape[-1],
         action_dim=train_ds.target_action_dim,
         base_dim=int(cfg["model"]["base_dim"]),
@@ -94,7 +111,29 @@ def main() -> None:
         kernel_size=int(cfg["model"]["kernel_size"]),
         groups=int(cfg["model"]["groups"]),
         dropout=float(cfg["model"]["dropout"]),
-    ).to(device)
+    )
+    if cfg["target"]["type"] == "dct_softmask":
+        gate_cfg = cfg["target"].get("gate", {})
+        model = FrequencySoftmaskTemporalUNetFlow(
+            base_model,
+            sequence_length=train_ds.target_seq_len,
+            init_logit=float(gate_cfg.get("init_logit", 2.0)),
+            temperature=float(gate_cfg.get("temperature", 1.0)),
+        ).to(device)
+    elif cfg["target"]["type"] == "sparse_dct_anchored_residual":
+        gate_cfg = cfg["target"].get("gate", {})
+        gate_mode = str(gate_cfg.get("mode", gate_cfg.get("type", "softmask")))
+        if gate_mode in {"softmask", "soft_gate", "soft"}:
+            model = FrequencySoftmaskTemporalUNetFlow(
+                base_model,
+                sequence_length=train_ds.target_seq_len,
+                init_logit=float(gate_cfg.get("init_logit", -2.0)),
+                temperature=float(gate_cfg.get("temperature", 1.0)),
+            ).to(device)
+        else:
+            model = base_model.to(device)
+    else:
+        model = base_model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["training"]["lr"]), weight_decay=float(cfg["training"]["weight_decay"]))
     max_steps = _max_steps(cfg)
     steps_per_epoch = len(train_loader) if max_steps is None else min(len(train_loader), max_steps)
@@ -120,18 +159,21 @@ def main() -> None:
         "normalization": {"action": action_stats.to_jsonable(), "obs": obs_stats.to_jsonable()},
     }
     _write_json(metadata, run_dir / "metadata.json")
+    base_policy = load_base_policy_from_config(cfg, device, metadata=metadata)
+    _attach_base_action_chunks(train_ds, base_policy, cfg, device)
+    _attach_base_action_chunks(val_ds, base_policy, cfg, device)
 
     best_val = float("inf")
     history: list[dict[str, Any]] = []
     eval_every = int(cfg["training"].get("eval_every_epochs", 10))
     for epoch in range(1, int(cfg["training"]["epochs"]) + 1):
-        train_loss = _train_one_epoch(model, optimizer, train_loader, device, cfg, max_steps, scheduler, ema)
+        train_loss = _train_one_epoch(model, optimizer, train_loader, device, cfg, max_steps, scheduler, ema, base_policy=base_policy)
         should_eval = epoch == 1 or epoch % eval_every == 0 or epoch == int(cfg["training"]["epochs"])
         row: dict[str, Any] = {"epoch": epoch, "train/fm_loss": train_loss, "train/lr": float(optimizer.param_groups[0]["lr"])}
         val_metrics = None
         if should_eval:
             with use_ema_weights(model, ema):
-                val_metrics = _evaluate(model, val_loader, device, cfg, train_ds)
+                val_metrics = _evaluate(model, val_loader, device, cfg, train_ds, base_policy=base_policy)
             row.update({f"val/{k}": v for k, v in val_metrics.items()})
         history.append(row)
         if wandb_run is not None:
@@ -160,13 +202,24 @@ def main() -> None:
     print(f"Metrics JSON: {metrics_path.relative_to(PROJECT_ROOT)}")
 
 
-def _train_one_epoch(model, optimizer, loader, device, cfg, max_steps, scheduler, ema) -> float:
+def _train_one_epoch(model, optimizer, loader, device, cfg, max_steps, scheduler, ema, base_policy=None) -> float:
     model.train()
     losses = []
     for step, batch in enumerate(loader, start=1):
         obs = batch["obs"].to(device)
         target = _target_from_batch(batch, cfg).to(device)
-        loss = flow_matching_loss(model, obs, target)
+        action_chunk = batch["action_chunk"].to(device)
+        base_action_chunk = batch.get("base_action_chunk")
+        base_action_chunk = base_action_chunk.to(device) if base_action_chunk is not None else None
+        loss = _training_loss(
+            model,
+            obs,
+            target,
+            cfg,
+            action_chunk=action_chunk,
+            base_policy=base_policy,
+            base_action_chunk=base_action_chunk,
+        )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["training"]["grad_clip_norm"]))
@@ -182,44 +235,137 @@ def _train_one_epoch(model, optimizer, loader, device, cfg, max_steps, scheduler
 
 
 @torch.no_grad()
-def _evaluate(model, loader, device, cfg, train_ds) -> dict[str, float]:
+def _evaluate(model, loader, device, cfg, train_ds, base_policy=None) -> dict[str, float]:
     model.eval()
     fm_losses, preds, trues = [], [], []
     for batch in loader:
         obs = batch["obs"].to(device)
         target = _target_from_batch(batch, cfg).to(device)
-        fm_losses.append(float(flow_matching_loss(model, obs, target).detach().cpu()))
+        action_chunk = batch["action_chunk"].to(device)
+        base_action_chunk = batch.get("base_action_chunk")
+        base_action_chunk = base_action_chunk.to(device) if base_action_chunk is not None else None
+        fm_losses.append(
+            float(
+                _training_loss(
+                    model,
+                    obs,
+                    target,
+                    cfg,
+                    action_chunk=action_chunk,
+                    base_policy=base_policy,
+                    base_action_chunk=base_action_chunk,
+                )
+                .detach()
+                .cpu()
+            )
+        )
         pred = euler_sample(model, obs, target_shape=train_ds.target_shape, num_steps=int(cfg["sampling"]["num_flow_steps"]))
-        preds.append(_decode_actions(pred.cpu().numpy(), cfg, train_ds))
+        preds.append(_decode_actions(pred.cpu().numpy(), cfg, train_ds, model=model, obs=obs, base_policy=base_policy))
         trues.append(batch["action_chunk"].numpy())
     pred_actions = np.concatenate(preds, axis=0)
     true_actions = np.concatenate(trues, axis=0)
-    return {
+    metrics = {
         "fm_loss": float(np.mean(fm_losses)),
         "action_mse": reconstruction_mse(true_actions, pred_actions),
         "smoothness": smoothness(pred_actions),
         "true_smoothness": smoothness(true_actions),
         "delta_action_mse": delta_action_mse(true_actions, pred_actions),
     }
+    metrics.update(_gate_metrics(model))
+    return metrics
 
 
 def _target_from_batch(batch, cfg):
     return batch["target_seq"]
 
 
-def _decode_actions(target: np.ndarray, cfg: dict[str, Any], train_ds) -> np.ndarray:
-    if cfg["target"]["type"] == "raw":
-        return target
-    if cfg["target"]["type"] == "dct_lowfreq":
-        coeffs = np.zeros((target.shape[0], train_ds.horizon, train_ds.action_dim), dtype=np.float32)
-        coeffs[:, : int(cfg["target"]["dct_k"]), :] = target
-        return idct(coeffs, axis=1, norm="ortho")
-    if cfg["target"]["type"] == "dct_fullfreq":
-        return idct(target, axis=1, norm="ortho")
-    if cfg["target"]["type"] == "dct_sparse":
-        coeffs, _ = topk_frequency_bins(target, int(cfg["target"]["dct_k"]))
-        return idct(coeffs, axis=1, norm="ortho")
-    raise ValueError(f"Unsupported target.type: {cfg['target']['type']}")
+@torch.no_grad()
+def _attach_base_action_chunks(dataset, base_policy, cfg, device) -> None:
+    if base_policy is None or not is_anchored_residual(cfg):
+        return
+    loader = DataLoader(dataset, batch_size=int(cfg["training"]["batch_size"]), shuffle=False, num_workers=0)
+    chunks = []
+    for batch in loader:
+        obs = batch["obs"].to(device)
+        base_actions = sample_normalized_actions(
+            base_policy,
+            obs,
+            num_steps=base_num_flow_steps(cfg),
+            noise_mode=base_noise_mode(cfg),
+        )
+        chunks.append(base_actions.detach().cpu().numpy())
+    dataset.set_base_action_chunks(np.concatenate(chunks, axis=0))
+
+
+def _training_loss(
+    model,
+    obs: torch.Tensor,
+    target: torch.Tensor,
+    cfg: dict[str, Any],
+    action_chunk: torch.Tensor | None = None,
+    base_policy=None,
+    base_action_chunk: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if is_raw_anchored_residual(cfg):
+        if action_chunk is None:
+            raise ValueError("raw_anchored_residual training requires action_chunk")
+        target = action_chunk - base_action_chunk if base_action_chunk is not None else raw_anchored_residual_target(action_chunk, obs, base_policy, cfg)
+    elif is_sparse_dct_anchored_residual(cfg):
+        if action_chunk is None:
+            raise ValueError("sparse_dct_anchored_residual training requires action_chunk")
+        if base_action_chunk is not None:
+            target = dct_time_torch(action_chunk - base_action_chunk)
+        else:
+            target = sparse_dct_anchored_residual_target(action_chunk, obs, base_policy, cfg)
+    flow_target = model.transform_target(target) if hasattr(model, "transform_target") else target
+    loss = flow_matching_loss(model, obs, flow_target)
+    gate_cfg = cfg["target"].get("gate", {})
+    reconstruction_weight = float(gate_cfg.get("reconstruction_weight", 0.0))
+    if cfg["target"]["type"] == "dct_softmask" and reconstruction_weight > 0.0 and action_chunk is not None:
+        recon = idct_time_torch(flow_target[..., : action_chunk.shape[-1]])
+        loss = loss + reconstruction_weight * torch.mean((recon - action_chunk) ** 2)
+    if is_sparse_dct_anchored_residual(cfg) and reconstruction_weight > 0.0 and action_chunk is not None:
+        recon = idct_time_torch(flow_target[..., : action_chunk.shape[-1]])
+        target_residual = idct_time_torch(target[..., : action_chunk.shape[-1]])
+        loss = loss + reconstruction_weight * torch.mean((recon - target_residual) ** 2)
+    sparsity_weight = float(gate_cfg.get("sparsity_weight", 0.0))
+    if sparsity_weight > 0.0 and hasattr(model, "gate_l1"):
+        loss = loss + sparsity_weight * model.gate_l1()
+    return loss
+
+
+def _decode_actions(target: np.ndarray, cfg: dict[str, Any], train_ds, model=None, obs: torch.Tensor | None = None, base_policy=None) -> np.ndarray:
+    decoded = decode_action_target(
+        target,
+        target_type=cfg["target"]["type"],
+        horizon=train_ds.horizon,
+        action_dim=train_ds.action_dim,
+        dct_k=cfg["target"].get("dct_k"),
+    )
+    if is_raw_anchored_residual(cfg):
+        if obs is None:
+            raise ValueError("raw_anchored_residual decoding requires obs")
+        residual = torch.from_numpy(decoded).to(device=obs.device, dtype=obs.dtype)
+        return combine_raw_base_and_residual(residual, obs, base_policy, cfg).detach().cpu().numpy()
+    if is_sparse_dct_anchored_residual(cfg):
+        if obs is None:
+            raise ValueError("sparse_dct_anchored_residual decoding requires obs")
+        residual = torch.from_numpy(decoded).to(device=obs.device, dtype=obs.dtype)
+        return combine_base_and_residual(residual, obs, base_policy, cfg).detach().cpu().numpy()
+    if is_anchored_residual(cfg):
+        raise ValueError(f"Unsupported anchored residual target: {cfg['target']['type']}")
+    return decoded
+
+def _gate_metrics(model) -> dict[str, float]:
+    if not hasattr(model, "gates"):
+        return {}
+    gates = model.gates().detach().cpu().numpy().astype(np.float64)
+    return {
+        "gate_mean": float(np.mean(gates)),
+        "gate_min": float(np.min(gates)),
+        "gate_max": float(np.max(gates)),
+        "effective_k": float(np.sum(gates)),
+    }
 
 
 def _max_steps(cfg):

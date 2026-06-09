@@ -1,0 +1,40 @@
+run:
+  name: square_ph_spectral_analysis
+  seed: 2
+
+dataset:
+  kind: robomimic
+  path: robomimic/datasets/square/ph/low_dim_v15.hdf5
+  limit_demos: null
+  val_fraction: 0.1
+  analysis_split: all
+
+action:
+  source: auto
+  action_dict_keys:
+    - rel_pos
+    - rel_rot_6d
+    - gripper
+  legacy_key: actions
+
+chunking:
+  horizon: 16
+  stride: 1
+  k_values: [2, 4, 8, 12, 16]
+
+spectral:
+  fft:
+    enabled: true
+  morlet:
+    enabled: true
+    num_scales: 16
+    w0: 6.0
+
+normalization:
+  type: per_dim_minmax
+  eps: 1.0e-8
+
+outputs:
+  log_dir: logs/analysis/spectral/square
+  metrics_dir: outputs/analysis/spectral/square/metrics
+  figures_dir: outputs/analysis/spectral/square/figures

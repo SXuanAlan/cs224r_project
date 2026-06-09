@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Compute Can transition-conditioned full-spectrum DCT energy."""
+"""Compute transition-conditioned full-spectrum DCT energy."""
 
 from __future__ import annotations
 
@@ -30,13 +30,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/analysis/can_frequency_diagnostic.yaml")
     parser.add_argument("--tau", type=float, default=None)
+    parser.add_argument("--output-root", default="outputs/analysis/p1b_can_phase_spectrum")
+    parser.add_argument("--prefix", default="can_phase_spectrum")
+    parser.add_argument("--title-task", default="Can")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     cfg = load_yaml(PROJECT_ROOT / args.config)
-    chunks, groups, gripper_dim, tau = _load_can_chunks(cfg, args.tau)
+    chunks, groups, gripper_dim, tau = _load_chunks(cfg, args.tau)
     metrics = per_phase_spectrum(
         chunks,
         gripper_dim_index=gripper_dim,
@@ -51,22 +54,22 @@ def main() -> None:
     }
     metrics["selection_note"] = "Actions are normalized with the same per-dim minmax convention as frequency diagnostics."
 
-    out_root = PROJECT_ROOT / "outputs" / "analysis" / "p1b_can_phase_spectrum"
+    out_root = PROJECT_ROOT / args.output_root
     metrics_dir = out_root / "metrics"
     figures_dir = out_root / "figures"
     metrics_dir.mkdir(parents=True, exist_ok=True)
     figures_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = metrics_dir / "can_phase_spectrum.json"
+    metrics_path = metrics_dir / f"{args.prefix}.json"
     metrics_path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
 
-    _plot_aggregate(metrics, figures_dir / "can_phase_spectrum_aggregate.png")
-    _plot_per_channel(metrics, figures_dir / "can_phase_spectrum_per_channel.png")
+    _plot_aggregate(metrics, figures_dir / f"{args.prefix}_aggregate.png", args.title_task)
+    _plot_per_channel(metrics, figures_dir / f"{args.prefix}_per_channel.png", args.title_task)
     print(metrics_path.relative_to(PROJECT_ROOT))
-    print((figures_dir / "can_phase_spectrum_aggregate.png").relative_to(PROJECT_ROOT))
-    print((figures_dir / "can_phase_spectrum_per_channel.png").relative_to(PROJECT_ROOT))
+    print((figures_dir / f"{args.prefix}_aggregate.png").relative_to(PROJECT_ROOT))
+    print((figures_dir / f"{args.prefix}_per_channel.png").relative_to(PROJECT_ROOT))
 
 
-def _load_can_chunks(cfg: dict[str, Any], tau_override: float | None) -> tuple[np.ndarray, dict[str, list[int]], int, float]:
+def _load_chunks(cfg: dict[str, Any], tau_override: float | None) -> tuple[np.ndarray, dict[str, list[int]], int, float]:
     dataset_path = PROJECT_ROOT / cfg["dataset"]["path"]
     action_data = load_actions(
         dataset_path,
@@ -96,13 +99,13 @@ def _load_can_chunks(cfg: dict[str, Any], tau_override: float | None) -> tuple[n
     return chunk_data.chunks, groups, gripper_dim, tau
 
 
-def _plot_aggregate(metrics: dict[str, Any], path: Path) -> None:
+def _plot_aggregate(metrics: dict[str, Any], path: Path, title_task: str) -> None:
     x = np.arange(len(metrics["phases"]["transition"]["aggregate"]))
     fig, ax = plt.subplots(figsize=(7.0, 4.0))
     for phase, label in [("transition", "transition"), ("non_transition", "non-transition")]:
         ax.plot(x, metrics["phases"][phase]["aggregate"], marker="o", label=label)
     ax.axvline(7.5, linestyle="--", color="black", linewidth=1.0, label="K=8 cutoff")
-    ax.set_title("Can DCT Spectrum by Gripper-Transition Phase")
+    ax.set_title(f"{title_task} DCT Spectrum by Gripper-Transition Phase")
     ax.set_xlabel("DCT frequency index k")
     ax.set_ylabel("Mean normalized energy")
     ax.set_xticks(x)
@@ -113,7 +116,7 @@ def _plot_aggregate(metrics: dict[str, Any], path: Path) -> None:
     plt.close(fig)
 
 
-def _plot_per_channel(metrics: dict[str, Any], path: Path) -> None:
+def _plot_per_channel(metrics: dict[str, Any], path: Path, title_task: str) -> None:
     groups = ["translation", "rotation", "gripper"]
     x = np.arange(len(metrics["phases"]["transition"]["aggregate"]))
     fig, axes = plt.subplots(len(groups), 1, figsize=(7.0, 8.0), sharex=True)
@@ -126,7 +129,7 @@ def _plot_per_channel(metrics: dict[str, Any], path: Path) -> None:
         ax.grid(True, alpha=0.25)
     axes[-1].set_xlabel("DCT frequency index k")
     axes[0].legend()
-    fig.suptitle("Can Per-Channel DCT Spectrum by Phase", y=0.995)
+    fig.suptitle(f"{title_task} Per-Channel DCT Spectrum by Phase", y=0.995)
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)

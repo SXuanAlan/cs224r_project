@@ -1,0 +1,34 @@
+run:
+  name: pusht_spectral_analysis
+  seed: 2
+
+dataset:
+  kind: pusht
+  path: data/pusht/pusht_cchi_v7_replay.zarr
+  obs_key: state
+  action_key: action
+  limit_demos: null
+  val_fraction: 0.1
+  analysis_split: all
+
+chunking:
+  horizon: 16
+  stride: 1
+  k_values: [2, 4, 8, 12, 16]
+
+spectral:
+  fft:
+    enabled: true
+  morlet:
+    enabled: true
+    num_scales: 16
+    w0: 6.0
+
+normalization:
+  type: per_dim_minmax
+  eps: 1.0e-8
+
+outputs:
+  log_dir: logs/analysis/spectral/pusht
+  metrics_dir: outputs/analysis/spectral/pusht/metrics
+  figures_dir: outputs/analysis/spectral/pusht/figures

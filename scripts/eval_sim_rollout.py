@@ -18,15 +18,27 @@ import h5py
 import imageio.v2 as imageio
 import numpy as np
 import torch
-from scipy.fft import idct
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from fgac.models.flow_matching import FlowMatchingMLP, TemporalUNetFlow, euler_sample
-from fgac.transforms.dct import topk_frequency_bins
+from fgac.models.flow_matching import (
+    FlowMatchingMLP,
+    FrequencySoftmaskTemporalUNetFlow,
+    TemporalUNetFlow,
+    euler_sample,
+)
+from fgac.models.policy_io import (
+    combine_base_and_residual,
+    combine_raw_base_and_residual,
+    is_anchored_residual,
+    is_raw_anchored_residual,
+    is_sparse_dct_anchored_residual,
+    load_base_policy_from_config,
+)
+from fgac.transforms.dct import decode_action_target
 from fgac.utils.config import load_yaml
 
 
@@ -49,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--residual-lambda", type=float, default=None)
     return parser.parse_args()
 
 
@@ -58,13 +71,9 @@ def main() -> None:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
     metadata = ckpt["metadata"]
+    if args.residual_lambda is not None:
+        cfg.setdefault("target", {})["residual_lambda"] = float(args.residual_lambda)
     sim_cfg = cfg.get("simulation_video", {})
-
-    if metadata["action"]["source"] != "legacy":
-        raise ValueError(
-            "Simulation rollout currently requires executable legacy env actions. "
-            f"Checkpoint action source is {metadata['action']['source']}."
-        )
 
     device_name = args.device or cfg["training"].get("device", "cuda")
     device = torch.device("cuda" if device_name == "cuda" and torch.cuda.is_available() else "cpu")
@@ -129,6 +138,7 @@ def main() -> None:
         "action_exec_horizon": action_exec_horizon,
         "max_videos": max_videos,
         "seed": seed,
+        "residual_lambda": cfg.get("target", {}).get("residual_lambda") if is_anchored_residual(cfg) else None,
         "summary": _summarize_rollouts(results),
         "rollouts": results,
     }
@@ -138,25 +148,27 @@ def main() -> None:
 
 
 def _load_model(ckpt: dict[str, Any], metadata: dict[str, Any], cfg: dict[str, Any], device: torch.device):
-    action_dim = int(metadata["dataset"]["action_dim"])
+    env_action_dim = int(metadata["dataset"]["action_dim"])
     horizon = int(cfg["chunking"]["horizon"])
     target_type = cfg["target"]["type"]
+    target_meta = metadata.get("target", {})
+    model_action_dim = int(target_meta.get("target_action_dim", env_action_dim))
+    target_seq_len = int(target_meta.get("target_seq_len", horizon))
     model_cfg = cfg.get("model", {})
     model_type = model_cfg.get("type", "mlp")
-    if target_type == "raw":
-        target_dim = horizon * action_dim
-        target_seq_len = horizon
-    elif target_type == "dct_lowfreq":
-        target_seq_len = int(cfg["target"]["dct_k"])
-        target_dim = target_seq_len * action_dim
-    elif target_type == "dct_fullfreq":
-        target_seq_len = horizon
-        target_dim = target_seq_len * action_dim
-    elif target_type == "dct_sparse":
-        target_seq_len = horizon
-        target_dim = target_seq_len * action_dim
-    else:
+    if target_type not in {
+        "raw",
+        "dct_lowfreq",
+        "dct_fullfreq",
+        "dct_sparse",
+        "dct_channel_sparse",
+        "dct_sparse_residual",
+        "raw_anchored_residual",
+        "sparse_dct_anchored_residual",
+        "dct_softmask",
+    }:
         raise ValueError(f"Unsupported target type: {target_type}")
+    target_dim = int(target_meta.get("target_dim", target_seq_len * model_action_dim))
     if model_type == "mlp":
         model = FlowMatchingMLP(
             obs_dim=int(metadata["dataset"]["obs_dim"]),
@@ -167,9 +179,9 @@ def _load_model(ckpt: dict[str, Any], metadata: dict[str, Any], cfg: dict[str, A
             dropout=float(model_cfg.get("dropout", 0.0)),
         ).to(device)
     elif model_type == "temporal_unet":
-        model = TemporalUNetFlow(
+        base_model = TemporalUNetFlow(
             obs_dim=int(metadata["dataset"]["obs_dim"]),
-            action_dim=action_dim,
+            action_dim=model_action_dim,
             base_dim=int(model_cfg.get("base_dim", 128)),
             dim_mults=tuple(int(v) for v in model_cfg.get("dim_mults", [1, 2, 4])),
             time_embed_dim=int(model_cfg.get("time_embed_dim", 128)),
@@ -177,12 +189,36 @@ def _load_model(ckpt: dict[str, Any], metadata: dict[str, Any], cfg: dict[str, A
             kernel_size=int(model_cfg.get("kernel_size", 5)),
             groups=int(model_cfg.get("groups", 8)),
             dropout=float(model_cfg.get("dropout", 0.0)),
-        ).to(device)
-        model.target_shape = (target_seq_len, action_dim)
+        )
+        if target_type == "dct_softmask":
+            gate_cfg = cfg["target"].get("gate", {})
+            model = FrequencySoftmaskTemporalUNetFlow(
+                base_model,
+                sequence_length=target_seq_len,
+                init_logit=float(gate_cfg.get("init_logit", 2.0)),
+                temperature=float(gate_cfg.get("temperature", 1.0)),
+            ).to(device)
+        elif target_type == "sparse_dct_anchored_residual":
+            gate_cfg = cfg["target"].get("gate", {})
+            gate_mode = str(gate_cfg.get("mode", gate_cfg.get("type", "softmask")))
+            if gate_mode in {"softmask", "soft_gate", "soft"}:
+                model = FrequencySoftmaskTemporalUNetFlow(
+                    base_model,
+                    sequence_length=target_seq_len,
+                    init_logit=float(gate_cfg.get("init_logit", -2.0)),
+                    temperature=float(gate_cfg.get("temperature", 1.0)),
+                ).to(device)
+            else:
+                model = base_model.to(device)
+        else:
+            model = base_model.to(device)
+        model.target_shape = (target_seq_len, model_action_dim)
     else:
         raise ValueError(f"Unsupported model.type: {model_type}")
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
+    model.base_policy = load_base_policy_from_config(cfg, device, metadata=metadata)
+    model.raw_base_policy = model.base_policy
     return model
 
 
@@ -319,32 +355,65 @@ def _sample_action_chunk(
             target_dim=model.net[-1].out_features,
             num_steps=int(cfg["sampling"]["num_flow_steps"]),
         ).cpu().numpy()
-    norm_actions = _decode_target(target, cfg, metadata)[0]
+    norm_actions = _decode_target(target, cfg, metadata, model=model)[0]
+    if is_raw_anchored_residual(cfg):
+        residual = torch.from_numpy(norm_actions[None].astype(np.float32)).to(device)
+        norm_actions = combine_raw_base_and_residual(residual, obs_tensor, getattr(model, "raw_base_policy", None), cfg)[0].cpu().numpy()
+    elif is_sparse_dct_anchored_residual(cfg):
+        residual = torch.from_numpy(norm_actions[None].astype(np.float32)).to(device)
+        norm_actions = combine_base_and_residual(residual, obs_tensor, getattr(model, "base_policy", None), cfg)[0].cpu().numpy()
     if cfg.get("sampling", {}).get("clip_normalized_actions", True):
         norm_actions = np.clip(norm_actions, -1.0, 1.0)
-    return list(_unnormalize_minmax(norm_actions, metadata["normalization"]["action"]))
+    policy_actions = _unnormalize_minmax(norm_actions, metadata["normalization"]["action"])
+    env_actions = _policy_actions_to_env_actions(policy_actions, metadata)
+    return list(env_actions)
 
 
-def _decode_target(target: np.ndarray, cfg: dict[str, Any], metadata: dict[str, Any]) -> np.ndarray:
-    horizon = int(cfg["chunking"]["horizon"])
-    action_dim = int(metadata["dataset"]["action_dim"])
-    if cfg["target"]["type"] == "raw":
-        if target.ndim == 3:
-            return target
-        return target.reshape(target.shape[0], horizon, action_dim)
-    if cfg["target"]["type"] == "dct_lowfreq":
-        k = int(cfg["target"]["dct_k"])
-        coeffs = np.zeros((target.shape[0], horizon, action_dim), dtype=np.float32)
-        coeffs[:, :k, :] = target if target.ndim == 3 else target.reshape(target.shape[0], k, action_dim)
-        return idct(coeffs, axis=1, norm="ortho")
-    if cfg["target"]["type"] == "dct_fullfreq":
-        coeffs = target if target.ndim == 3 else target.reshape(target.shape[0], horizon, action_dim)
-        return idct(coeffs, axis=1, norm="ortho")
-    if cfg["target"]["type"] == "dct_sparse":
-        coeffs = target if target.ndim == 3 else target.reshape(target.shape[0], horizon, action_dim)
-        coeffs, _ = topk_frequency_bins(coeffs, int(cfg["target"]["dct_k"]))
-        return idct(coeffs, axis=1, norm="ortho")
-    raise ValueError(f"Unsupported target type: {cfg['target']['type']}")
+def _policy_actions_to_env_actions(actions: np.ndarray, metadata: dict[str, Any]) -> np.ndarray:
+    action_meta = metadata.get("action", {})
+    if action_meta.get("source") == "legacy":
+        return actions
+    if action_meta.get("source") != "action_dict":
+        raise ValueError(f"Unsupported action source for rollout: {action_meta.get('source')}")
+
+    dim_names = action_meta.get("dim_names", [])
+    rel_pos_idx = _indices_with_prefix(dim_names, "rel_pos_")
+    rel_rot_6d_idx = _indices_with_prefix(dim_names, "rel_rot_6d_")
+    gripper_idx = _indices_with_prefix(dim_names, "gripper_")
+    if len(rel_pos_idx) != 3 or len(rel_rot_6d_idx) != 6 or len(gripper_idx) != 1:
+        raise ValueError(
+            "action_dict rollout conversion requires rel_pos(3), rel_rot_6d(6), and gripper(1); "
+            f"got dim names: {dim_names}"
+        )
+
+    rel_pos = actions[..., rel_pos_idx]
+    rel_rot_6d = actions[..., rel_rot_6d_idx]
+    gripper = actions[..., gripper_idx]
+    rel_rot_axis_angle = _rot_6d_to_axis_angle(rel_rot_6d)
+    return np.concatenate([rel_pos, rel_rot_axis_angle, gripper], axis=-1).astype(np.float64)
+
+
+def _indices_with_prefix(dim_names: list[str], prefix: str) -> list[int]:
+    return [idx for idx, name in enumerate(dim_names) if name.startswith(prefix)]
+
+
+def _rot_6d_to_axis_angle(rot_6d: np.ndarray) -> np.ndarray:
+    import robomimic.utils.torch_utils as TorchUtils
+
+    original_shape = rot_6d.shape[:-1]
+    tensor = torch.from_numpy(rot_6d.reshape(-1, 6).astype(np.float32))
+    axis_angle = TorchUtils.rot_6d_to_axis_angle(tensor).cpu().numpy()
+    return axis_angle.reshape(*original_shape, 3)
+
+
+def _decode_target(target: np.ndarray, cfg: dict[str, Any], metadata: dict[str, Any], model=None) -> np.ndarray:
+    return decode_action_target(
+        target,
+        target_type=cfg["target"]["type"],
+        horizon=int(cfg["chunking"]["horizon"]),
+        action_dim=int(metadata["dataset"]["action_dim"]),
+        dct_k=cfg["target"].get("dct_k"),
+    )
 
 
 def _obs_history_to_vector(

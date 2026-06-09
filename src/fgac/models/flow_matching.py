@@ -60,6 +60,8 @@ def euler_sample(
     num_steps: int,
     target_dim: int | None = None,
     target_shape: Sequence[int] | None = None,
+    noise_mode: str = "normal",
+    initial_noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample x_1 by integrating dx/dt = v_theta(x, t, obs) from Gaussian noise."""
     if target_shape is None:
@@ -68,7 +70,16 @@ def euler_sample(
         sample_shape = (obs.shape[0], int(target_dim))
     else:
         sample_shape = (obs.shape[0], *[int(v) for v in target_shape])
-    x = torch.randn(sample_shape, device=obs.device, dtype=obs.dtype)
+    if initial_noise is not None:
+        if tuple(initial_noise.shape) != tuple(sample_shape):
+            raise ValueError(f"initial_noise shape {tuple(initial_noise.shape)} does not match {sample_shape}")
+        x = initial_noise.to(device=obs.device, dtype=obs.dtype)
+    elif noise_mode == "normal":
+        x = torch.randn(sample_shape, device=obs.device, dtype=obs.dtype)
+    elif noise_mode == "zero":
+        x = torch.zeros(sample_shape, device=obs.device, dtype=obs.dtype)
+    else:
+        raise ValueError(f"Unsupported noise_mode: {noise_mode}")
     dt = 1.0 / float(num_steps)
     for step in range(num_steps):
         t_value = torch.full((obs.shape[0], 1), step / float(num_steps), device=obs.device, dtype=obs.dtype)
@@ -200,6 +211,43 @@ class TemporalUNetFlow(nn.Module):
             x = up["block2"](x, cond)
         x = self.final_block(x, cond)
         return self.final_conv(x).transpose(1, 2)
+
+
+class FrequencySoftmaskTemporalUNetFlow(nn.Module):
+    """Temporal UNet with learned per-frequency target masks.
+
+    The gates define the DCT target distribution used during training, so
+    sampled coefficients are decoded directly at evaluation time.
+    """
+
+    def __init__(
+        self,
+        base_model: TemporalUNetFlow,
+        sequence_length: int,
+        init_logit: float = 2.0,
+        temperature: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.base_model = base_model
+        self.action_dim = base_model.action_dim
+        self.sequence_length = int(sequence_length)
+        self.temperature = float(temperature)
+        self.gate_logits = nn.Parameter(torch.full((self.sequence_length,), float(init_logit)))
+
+    def gates(self) -> torch.Tensor:
+        return torch.sigmoid(self.gate_logits / max(self.temperature, 1.0e-6))
+
+    def gate_l1(self) -> torch.Tensor:
+        return self.gates().mean()
+
+    def effective_k(self) -> torch.Tensor:
+        return self.gates().sum()
+
+    def transform_target(self, target: torch.Tensor) -> torch.Tensor:
+        return target * self.gates().reshape(1, self.sequence_length, 1)
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
+        return self.base_model(x_t, t, obs)
 
 
 def _align_length(x: torch.Tensor, target_len: int) -> torch.Tensor:

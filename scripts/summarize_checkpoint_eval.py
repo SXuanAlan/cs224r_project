@@ -53,6 +53,7 @@ def main() -> None:
         "simulation_reset_mode": rollout.get("reset_mode"),
         "simulation_horizon": rollout.get("horizon"),
         "simulation_action_exec_horizon": rollout.get("action_exec_horizon"),
+        "simulation_residual_lambda": rollout.get("residual_lambda"),
         "videos": [row.get("video_path") for row in rollout.get("rollouts", []) if row.get("video_path")],
     }
     output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -80,13 +81,21 @@ def _default_output_path(metadata: dict[str, Any], run_id: str) -> Path:
 
 
 def _infer_task(metadata: dict[str, Any]) -> str:
-    dataset_path = str(metadata.get("dataset", {}).get("path", "")).lower()
+    dataset = metadata.get("dataset", {})
+    env_id = str(dataset.get("env_id", "")).lower()
+    if env_id:
+        return env_id.replace("-v1", "").replace("_", "-")
+    dataset_path = str(dataset.get("path", "")).lower()
     if "pusht" in dataset_path or "push_t" in dataset_path or "push-t" in dataset_path:
         return "pusht"
     if "/can/" in dataset_path or dataset_path.endswith("can"):
         return "can"
     if "/lift/" in dataset_path or dataset_path.endswith("lift"):
         return "lift"
+    if "/square/" in dataset_path or dataset_path.endswith("square"):
+        return "square"
+    if "tool_hang" in dataset_path or "tool-hang" in dataset_path:
+        return "tool-hang"
     return "unknown_task"
 
 

@@ -15,15 +15,26 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 import imageio.v2 as imageio
 import numpy as np
 import torch
-from scipy.fft import idct
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from fgac.models.flow_matching import TemporalUNetFlow, euler_sample
-from fgac.transforms.dct import topk_frequency_bins
+from fgac.models.flow_matching import (
+    FrequencySoftmaskTemporalUNetFlow,
+    TemporalUNetFlow,
+    euler_sample,
+)
+from fgac.models.policy_io import (
+    combine_base_and_residual,
+    combine_raw_base_and_residual,
+    is_anchored_residual,
+    is_raw_anchored_residual,
+    is_sparse_dct_anchored_residual,
+    load_base_policy_from_config,
+)
+from fgac.transforms.dct import decode_action_target
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--residual-lambda", type=float, default=None)
     return parser.parse_args()
 
 
@@ -44,6 +56,8 @@ def main() -> None:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
     metadata = ckpt["metadata"]
+    if args.residual_lambda is not None:
+        cfg.setdefault("target", {})["residual_lambda"] = float(args.residual_lambda)
     sim = cfg.get("simulation_video", {})
     device_name = args.device or cfg["training"].get("device", "cuda")
     device = torch.device("cuda" if device_name == "cuda" and torch.cuda.is_available() else "cpu")
@@ -75,6 +89,7 @@ def main() -> None:
         "horizon": horizon,
         "max_videos": max_videos,
         "seed": seed,
+        "residual_lambda": cfg.get("target", {}).get("residual_lambda") if is_anchored_residual(cfg) else None,
         "summary": _summarize(results),
         "rollouts": results,
     }
@@ -84,12 +99,13 @@ def main() -> None:
 
 
 def _load_model(ckpt: dict[str, Any], metadata: dict[str, Any], cfg: dict[str, Any], device: torch.device):
-    action_dim = int(metadata["dataset"]["action_dim"])
-    target_seq_len = int(metadata["target"]["target_seq_len"])
+    target_meta = metadata["target"]
+    model_action_dim = int(target_meta.get("target_action_dim", metadata["dataset"]["action_dim"]))
+    target_seq_len = int(target_meta["target_seq_len"])
     model_cfg = cfg["model"]
-    model = TemporalUNetFlow(
+    base_model = TemporalUNetFlow(
         obs_dim=int(metadata["dataset"]["obs_dim"]),
-        action_dim=action_dim,
+        action_dim=model_action_dim,
         base_dim=int(model_cfg["base_dim"]),
         dim_mults=tuple(int(v) for v in model_cfg["dim_mults"]),
         time_embed_dim=int(model_cfg["time_embed_dim"]),
@@ -97,10 +113,34 @@ def _load_model(ckpt: dict[str, Any], metadata: dict[str, Any], cfg: dict[str, A
         kernel_size=int(model_cfg["kernel_size"]),
         groups=int(model_cfg["groups"]),
         dropout=float(model_cfg["dropout"]),
-    ).to(device)
-    model.target_shape = (target_seq_len, action_dim)
+    )
+    if cfg["target"]["type"] == "dct_softmask":
+        gate_cfg = cfg["target"].get("gate", {})
+        model = FrequencySoftmaskTemporalUNetFlow(
+            base_model,
+            sequence_length=target_seq_len,
+            init_logit=float(gate_cfg.get("init_logit", 2.0)),
+            temperature=float(gate_cfg.get("temperature", 1.0)),
+        ).to(device)
+    elif cfg["target"]["type"] == "sparse_dct_anchored_residual":
+        gate_cfg = cfg["target"].get("gate", {})
+        gate_mode = str(gate_cfg.get("mode", gate_cfg.get("type", "softmask")))
+        if gate_mode in {"softmask", "soft_gate", "soft"}:
+            model = FrequencySoftmaskTemporalUNetFlow(
+                base_model,
+                sequence_length=target_seq_len,
+                init_logit=float(gate_cfg.get("init_logit", -2.0)),
+                temperature=float(gate_cfg.get("temperature", 1.0)),
+            ).to(device)
+        else:
+            model = base_model.to(device)
+    else:
+        model = base_model.to(device)
+    model.target_shape = (target_seq_len, model_action_dim)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
+    model.base_policy = load_base_policy_from_config(cfg, device, metadata=metadata)
+    model.raw_base_policy = model.base_policy
     return model
 
 
@@ -162,27 +202,26 @@ def _sample_action_chunk(model, obs_history: list[np.ndarray], cfg: dict[str, An
     obs_vec = np.concatenate([_normalize_zscore(obs, metadata["normalization"]["obs"]) for obs in obs_history], axis=0)
     obs_tensor = torch.from_numpy(obs_vec[None].astype(np.float32)).to(device)
     target = euler_sample(model, obs_tensor, target_shape=model.target_shape, num_steps=int(cfg["sampling"]["num_flow_steps"])).cpu().numpy()
-    norm_actions = _decode_target(target, cfg, metadata)[0]
+    norm_actions = _decode_target(target, cfg, metadata, model=model)[0]
+    if is_raw_anchored_residual(cfg):
+        residual = torch.from_numpy(norm_actions[None].astype(np.float32)).to(device)
+        norm_actions = combine_raw_base_and_residual(residual, obs_tensor, getattr(model, "raw_base_policy", None), cfg)[0].cpu().numpy()
+    elif is_sparse_dct_anchored_residual(cfg):
+        residual = torch.from_numpy(norm_actions[None].astype(np.float32)).to(device)
+        norm_actions = combine_base_and_residual(residual, obs_tensor, getattr(model, "base_policy", None), cfg)[0].cpu().numpy()
     if cfg.get("sampling", {}).get("clip_normalized_actions", True):
         norm_actions = np.clip(norm_actions, -1.0, 1.0)
     return list(_unnormalize_minmax(norm_actions, metadata["normalization"]["action"]))
 
 
-def _decode_target(target: np.ndarray, cfg: dict[str, Any], metadata: dict[str, Any]) -> np.ndarray:
-    horizon = int(cfg["chunking"]["horizon"])
-    action_dim = int(metadata["dataset"]["action_dim"])
-    if cfg["target"]["type"] == "raw":
-        return target
-    if cfg["target"]["type"] == "dct_lowfreq":
-        coeffs = np.zeros((target.shape[0], horizon, action_dim), dtype=np.float32)
-        coeffs[:, : int(cfg["target"]["dct_k"]), :] = target
-        return idct(coeffs, axis=1, norm="ortho")
-    if cfg["target"]["type"] == "dct_fullfreq":
-        return idct(target, axis=1, norm="ortho")
-    if cfg["target"]["type"] == "dct_sparse":
-        coeffs, _ = topk_frequency_bins(target, int(cfg["target"]["dct_k"]))
-        return idct(coeffs, axis=1, norm="ortho")
-    raise ValueError(f"Unsupported target.type: {cfg['target']['type']}")
+def _decode_target(target: np.ndarray, cfg: dict[str, Any], metadata: dict[str, Any], model=None) -> np.ndarray:
+    return decode_action_target(
+        target,
+        target_type=cfg["target"]["type"],
+        horizon=int(cfg["chunking"]["horizon"]),
+        action_dim=int(metadata["dataset"]["action_dim"]),
+        dct_k=cfg["target"].get("dct_k"),
+    )
 
 
 def _normalize_zscore(x: np.ndarray, stats: dict[str, Any]) -> np.ndarray:

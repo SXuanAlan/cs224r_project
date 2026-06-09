@@ -17,7 +17,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from scipy.fft import idct
 from torch.utils.data import DataLoader
 
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -40,8 +39,27 @@ from fgac.data.robomimic_hdf5 import (
     load_observations,
     split_demos,
 )
-from fgac.models.flow_matching import FlowMatchingMLP, TemporalUNetFlow, euler_sample, flow_matching_loss
-from fgac.transforms.dct import topk_frequency_bins
+from fgac.models.flow_matching import (
+    FlowMatchingMLP,
+    FrequencySoftmaskTemporalUNetFlow,
+    TemporalUNetFlow,
+    euler_sample,
+    flow_matching_loss,
+)
+from fgac.models.policy_io import (
+    base_noise_mode,
+    base_num_flow_steps,
+    combine_base_and_residual,
+    combine_raw_base_and_residual,
+    is_anchored_residual,
+    is_raw_anchored_residual,
+    is_sparse_dct_anchored_residual,
+    load_base_policy_from_config,
+    raw_anchored_residual_target,
+    sample_normalized_actions,
+    sparse_dct_anchored_residual_target,
+)
+from fgac.transforms.dct import dct_time_torch, decode_action_target, idct_time_torch
 from fgac.utils.config import load_yaml, save_yaml
 
 
@@ -179,6 +197,9 @@ def main() -> None:
         },
     }
     _write_json(metadata, run_dir / "metadata.json")
+    base_policy = load_base_policy_from_config(cfg, device, metadata=metadata)
+    _attach_base_action_chunks(train_ds, base_policy, cfg, device)
+    _attach_base_action_chunks(val_ds, base_policy, cfg, device)
 
     best_val = float("inf")
     history: list[dict[str, Any]] = []
@@ -195,6 +216,7 @@ def main() -> None:
             max_steps=max_steps,
             scheduler=scheduler,
             ema=ema,
+            base_policy=base_policy,
         )
         should_eval = epoch == 1 or epoch % eval_every_epochs == 0 or epoch == epochs
         current_lr = float(optimizer.param_groups[0]["lr"])
@@ -206,7 +228,7 @@ def main() -> None:
         val_metrics = None
         if should_eval:
             with use_ema_weights(model, ema):
-                val_metrics = _evaluate(model, val_loader, device, cfg, train_ds)
+                val_metrics = _evaluate(model, val_loader, device, cfg, train_ds, base_policy=base_policy)
             row.update({f"val/{k}": v for k, v in val_metrics.items()})
         history.append(row)
         if wandb_run is not None:
@@ -233,7 +255,7 @@ def main() -> None:
     video_path = None
     if cfg.get("eval_video", {}).get("enabled", False):
         video_path = videos_dir / "validation_action_chunks.mp4"
-        video_payload = _collect_eval_video_payload(model, val_loader, device, cfg, train_ds)
+        video_payload = _collect_eval_video_payload(model, val_loader, device, cfg, train_ds, base_policy=base_policy)
         save_action_chunk_eval_video(
             true_actions=video_payload["true"],
             pred_actions=video_payload["pred"],
@@ -290,7 +312,7 @@ def _build_model(cfg: dict[str, Any], train_ds: FlowMatchingChunkDataset) -> tor
             dropout=float(model_cfg.get("dropout", 0.0)),
         )
     if model_type == "temporal_unet":
-        return TemporalUNetFlow(
+        base_model = TemporalUNetFlow(
             obs_dim=train_ds.obs.shape[-1],
             action_dim=train_ds.target_action_dim,
             base_dim=int(model_cfg.get("base_dim", 128)),
@@ -301,6 +323,25 @@ def _build_model(cfg: dict[str, Any], train_ds: FlowMatchingChunkDataset) -> tor
             groups=int(model_cfg.get("groups", 8)),
             dropout=float(model_cfg.get("dropout", 0.0)),
         )
+        if cfg["target"]["type"] == "dct_softmask":
+            gate_cfg = cfg["target"].get("gate", {})
+            return FrequencySoftmaskTemporalUNetFlow(
+                base_model,
+                sequence_length=train_ds.target_seq_len,
+                init_logit=float(gate_cfg.get("init_logit", 2.0)),
+                temperature=float(gate_cfg.get("temperature", 1.0)),
+            )
+        if cfg["target"]["type"] == "sparse_dct_anchored_residual":
+            gate_cfg = cfg["target"].get("gate", {})
+            gate_mode = str(gate_cfg.get("mode", gate_cfg.get("type", "softmask")))
+            if gate_mode in {"softmask", "soft_gate", "soft"}:
+                return FrequencySoftmaskTemporalUNetFlow(
+                    base_model,
+                    sequence_length=train_ds.target_seq_len,
+                    init_logit=float(gate_cfg.get("init_logit", -2.0)),
+                    temperature=float(gate_cfg.get("temperature", 1.0)),
+                )
+        return base_model
     raise ValueError(f"Unsupported model.type: {model_type}")
 
 
@@ -324,6 +365,34 @@ def _sample_targets(model, obs: torch.Tensor, cfg: dict[str, Any], train_ds: Flo
         target_dim=train_ds.target_dim,
         num_steps=int(cfg["sampling"]["num_flow_steps"]),
     )
+
+
+@torch.no_grad()
+def _attach_base_action_chunks(
+    dataset: FlowMatchingChunkDataset,
+    base_policy,
+    cfg: dict[str, Any],
+    device: torch.device,
+) -> None:
+    if base_policy is None or not is_anchored_residual(cfg):
+        return
+    loader = DataLoader(
+        dataset,
+        batch_size=int(cfg["training"]["batch_size"]),
+        shuffle=False,
+        num_workers=0,
+    )
+    chunks: list[np.ndarray] = []
+    for batch in loader:
+        obs = batch["obs"].to(device)
+        base_actions = sample_normalized_actions(
+            base_policy,
+            obs,
+            num_steps=base_num_flow_steps(cfg),
+            noise_mode=base_noise_mode(cfg),
+        )
+        chunks.append(base_actions.detach().cpu().numpy())
+    dataset.set_base_action_chunks(np.concatenate(chunks, axis=0))
 
 
 def max_steps_from_cfg(cfg: dict[str, Any]) -> int | None:
@@ -404,6 +473,7 @@ def _train_one_epoch(
     max_steps: int | None,
     scheduler=None,
     ema: "EMAModel | None" = None,
+    base_policy=None,
 ) -> float:
     model.train()
     losses: list[float] = []
@@ -411,7 +481,18 @@ def _train_one_epoch(
     for step, batch in enumerate(loader, start=1):
         obs = batch["obs"].to(device)
         target = _target_from_batch(batch, cfg).to(device)
-        loss = flow_matching_loss(model, obs, target)
+        action_chunk = batch["action_chunk"].to(device)
+        base_action_chunk = batch.get("base_action_chunk")
+        base_action_chunk = base_action_chunk.to(device) if base_action_chunk is not None else None
+        loss = _training_loss(
+            model,
+            obs,
+            target,
+            cfg,
+            action_chunk=action_chunk,
+            base_policy=base_policy,
+            base_action_chunk=base_action_chunk,
+        )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if grad_clip > 0:
@@ -428,7 +509,7 @@ def _train_one_epoch(
 
 
 @torch.no_grad()
-def _evaluate(model, loader, device, cfg, train_ds: FlowMatchingChunkDataset) -> dict[str, float]:
+def _evaluate(model, loader, device, cfg, train_ds: FlowMatchingChunkDataset, base_policy=None) -> dict[str, float]:
     model.eval()
     fm_losses: list[float] = []
     pred_actions: list[np.ndarray] = []
@@ -436,50 +517,126 @@ def _evaluate(model, loader, device, cfg, train_ds: FlowMatchingChunkDataset) ->
     for batch in loader:
         obs = batch["obs"].to(device)
         target = _target_from_batch(batch, cfg).to(device)
-        fm_losses.append(float(flow_matching_loss(model, obs, target).detach().cpu()))
+        action_chunk = batch["action_chunk"].to(device)
+        base_action_chunk = batch.get("base_action_chunk")
+        base_action_chunk = base_action_chunk.to(device) if base_action_chunk is not None else None
+        fm_losses.append(
+            float(
+                _training_loss(
+                    model,
+                    obs,
+                    target,
+                    cfg,
+                    action_chunk=action_chunk,
+                    base_policy=base_policy,
+                    base_action_chunk=base_action_chunk,
+                )
+                .detach()
+                .cpu()
+            )
+        )
         pred_target = _sample_targets(model, obs, cfg, train_ds)
-        pred_actions.append(_decode_actions(pred_target.cpu().numpy(), cfg, train_ds))
+        pred_actions.append(_decode_actions(pred_target.cpu().numpy(), cfg, train_ds, model=model, obs=obs, base_policy=base_policy))
         true_actions.append(batch["action_chunk"].numpy())
     pred = np.concatenate(pred_actions, axis=0)
     true = np.concatenate(true_actions, axis=0)
-    return {
+    metrics = {
         "fm_loss": float(np.mean(fm_losses)),
         "action_mse": reconstruction_mse(true, pred),
         "smoothness": smoothness(pred),
         "true_smoothness": smoothness(true),
         "delta_action_mse": delta_action_mse(true, pred),
     }
+    metrics.update(_gate_metrics(model))
+    return metrics
 
 
-def _decode_actions(target: np.ndarray, cfg: dict[str, Any], train_ds: FlowMatchingChunkDataset) -> np.ndarray:
-    target_type = cfg["target"]["type"]
-    if target_type == "raw":
-        if target.ndim == 3:
-            return target
-        return target.reshape(target.shape[0], train_ds.horizon, train_ds.action_dim)
-    if target_type == "dct_lowfreq":
-        k = int(cfg["target"]["dct_k"])
-        coeffs = np.zeros((target.shape[0], train_ds.horizon, train_ds.action_dim), dtype=np.float32)
-        coeffs[:, :k, :] = target if target.ndim == 3 else target.reshape(target.shape[0], k, train_ds.action_dim)
-        return idct(coeffs, axis=1, norm="ortho")
-    if target_type == "dct_fullfreq":
-        coeffs = target if target.ndim == 3 else target.reshape(target.shape[0], train_ds.horizon, train_ds.action_dim)
-        return idct(coeffs, axis=1, norm="ortho")
-    if target_type == "dct_sparse":
-        coeffs = target if target.ndim == 3 else target.reshape(target.shape[0], train_ds.horizon, train_ds.action_dim)
-        coeffs, _ = topk_frequency_bins(coeffs, int(cfg["target"]["dct_k"]))
-        return idct(coeffs, axis=1, norm="ortho")
-    raise ValueError(f"Unsupported target_type: {target_type}")
+def _training_loss(
+    model,
+    obs: torch.Tensor,
+    target: torch.Tensor,
+    cfg: dict[str, Any],
+    action_chunk: torch.Tensor | None = None,
+    base_policy=None,
+    base_action_chunk: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if is_raw_anchored_residual(cfg):
+        if action_chunk is None:
+            raise ValueError("raw_anchored_residual training requires action_chunk")
+        target = action_chunk - base_action_chunk if base_action_chunk is not None else raw_anchored_residual_target(action_chunk, obs, base_policy, cfg)
+    elif is_sparse_dct_anchored_residual(cfg):
+        if action_chunk is None:
+            raise ValueError("sparse_dct_anchored_residual training requires action_chunk")
+        if base_action_chunk is not None:
+            target = dct_time_torch(action_chunk - base_action_chunk)
+        else:
+            target = sparse_dct_anchored_residual_target(action_chunk, obs, base_policy, cfg)
+    flow_target = model.transform_target(target) if hasattr(model, "transform_target") else target
+    loss = flow_matching_loss(model, obs, flow_target)
+    gate_cfg = cfg["target"].get("gate", {})
+    reconstruction_weight = float(gate_cfg.get("reconstruction_weight", 0.0))
+    if cfg["target"]["type"] == "dct_softmask" and reconstruction_weight > 0.0 and action_chunk is not None:
+        recon = idct_time_torch(flow_target[..., : action_chunk.shape[-1]])
+        loss = loss + reconstruction_weight * torch.mean((recon - action_chunk) ** 2)
+    if is_sparse_dct_anchored_residual(cfg) and reconstruction_weight > 0.0 and action_chunk is not None:
+        recon = idct_time_torch(flow_target[..., : action_chunk.shape[-1]])
+        target_residual = idct_time_torch(target[..., : action_chunk.shape[-1]])
+        loss = loss + reconstruction_weight * torch.mean((recon - target_residual) ** 2)
+    sparsity_weight = float(gate_cfg.get("sparsity_weight", 0.0))
+    if sparsity_weight > 0.0 and hasattr(model, "gate_l1"):
+        loss = loss + sparsity_weight * model.gate_l1()
+    return loss
+
+
+def _decode_actions(
+    target: np.ndarray,
+    cfg: dict[str, Any],
+    train_ds: FlowMatchingChunkDataset,
+    model=None,
+    obs: torch.Tensor | None = None,
+    base_policy=None,
+) -> np.ndarray:
+    decoded = decode_action_target(
+        target,
+        target_type=cfg["target"]["type"],
+        horizon=train_ds.horizon,
+        action_dim=train_ds.action_dim,
+        dct_k=cfg["target"].get("dct_k"),
+    )
+    if is_raw_anchored_residual(cfg):
+        if obs is None:
+            raise ValueError("raw_anchored_residual decoding requires obs")
+        residual = torch.from_numpy(decoded).to(device=obs.device, dtype=obs.dtype)
+        return combine_raw_base_and_residual(residual, obs, base_policy, cfg).detach().cpu().numpy()
+    if is_sparse_dct_anchored_residual(cfg):
+        if obs is None:
+            raise ValueError("sparse_dct_anchored_residual decoding requires obs")
+        residual = torch.from_numpy(decoded).to(device=obs.device, dtype=obs.dtype)
+        return combine_base_and_residual(residual, obs, base_policy, cfg).detach().cpu().numpy()
+    if is_anchored_residual(cfg):
+        raise ValueError(f"Unsupported anchored residual target: {cfg['target']['type']}")
+    return decoded
+
+def _gate_metrics(model) -> dict[str, float]:
+    if not hasattr(model, "gates"):
+        return {}
+    gates = model.gates().detach().cpu().numpy().astype(np.float64)
+    return {
+        "gate_mean": float(np.mean(gates)),
+        "gate_min": float(np.min(gates)),
+        "gate_max": float(np.max(gates)),
+        "effective_k": float(np.sum(gates)),
+    }
 
 
 @torch.no_grad()
-def _collect_eval_video_payload(model, loader, device, cfg, train_ds: FlowMatchingChunkDataset) -> dict[str, np.ndarray]:
+def _collect_eval_video_payload(model, loader, device, cfg, train_ds: FlowMatchingChunkDataset, base_policy=None) -> dict[str, np.ndarray]:
     model.eval()
     batch = next(iter(loader))
     obs = batch["obs"].to(device)
     pred_target = _sample_targets(model, obs, cfg, train_ds)
     return {
-        "pred": _decode_actions(pred_target.cpu().numpy(), cfg, train_ds),
+        "pred": _decode_actions(pred_target.cpu().numpy(), cfg, train_ds, model=model, obs=obs, base_policy=base_policy),
         "true": batch["action_chunk"].numpy(),
     }
 

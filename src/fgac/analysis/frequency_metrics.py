@@ -43,6 +43,52 @@ def mean_frequency_energy(z: np.ndarray, dims: list[int] | None = None, eps: flo
     return np.mean(normalized, axis=0).tolist()
 
 
+def mean_fft_energy(power: np.ndarray, dims: list[int] | None = None, eps: float = 1e-12) -> list[float]:
+    """Mean per-chunk-normalized FFT power at each rfft bin.
+
+    ``power`` has shape ``[N, F, d]`` (e.g. from ``rfft_power``). Energy is summed
+    over channels, normalized per chunk so each chunk's spectrum sums to ~1, then
+    averaged across chunks.
+    """
+    coeffs = power if dims is None else power[..., dims]
+    energy = np.sum(coeffs, axis=-1)
+    total = np.sum(energy, axis=1, keepdims=True)
+    normalized = energy / (total + eps)
+    return np.mean(normalized, axis=0).tolist()
+
+
+def mean_morlet_energy(scalogram: np.ndarray, dims: list[int] | None = None, eps: float = 1e-12) -> list[float]:
+    """Mean per-chunk-normalized Morlet energy at each scale.
+
+    ``scalogram`` has shape ``[N, S, d]`` (e.g. from ``morlet_scalogram``). Energy
+    is summed over channels, normalized per chunk so each chunk sums to ~1, then
+    averaged across chunks.
+    """
+    coeffs = scalogram if dims is None else scalogram[..., dims]
+    energy = np.sum(coeffs, axis=-1)
+    total = np.sum(energy, axis=1, keepdims=True)
+    normalized = energy / (total + eps)
+    return np.mean(normalized, axis=0).tolist()
+
+
+def energy_heatmap(power: np.ndarray, eps: float = 1e-12) -> list[list[float]]:
+    """Per-chunk-normalized mean energy per ``(frequency, dim)`` -> ``[F, d]`` list.
+
+    ``power`` has shape ``[N, F, d]`` (non-negative energy, e.g. ``z**2`` for DCT or
+    ``rfft_power`` for FFT). Each chunk is normalized over all ``(freq, dim)`` so its
+    map sums to ~1, then averaged across chunks. Returned as nested lists for JSON.
+    """
+    total = np.sum(power, axis=(1, 2), keepdims=True)
+    normalized = power / (total + eps)
+    return np.mean(normalized, axis=0).tolist()
+
+
+def normalize_tf_map(tf: np.ndarray, eps: float = 1e-12) -> list[list[float]]:
+    """Normalize a ``[S, H]`` time-frequency energy map to sum to 1 (for heatmaps)."""
+    tf = np.asarray(tf, dtype=np.float64)
+    return (tf / (tf.sum() + eps)).tolist()
+
+
 def per_phase_spectrum(
     actions_per_chunk: np.ndarray,
     gripper_dim_index: int,
